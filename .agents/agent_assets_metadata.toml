@@ -1,0 +1,14 @@
+uploads = []
+outputs = []
+
+[[generated]]
+id = "bPC4Zm5AnqyHW6Wr_QSuP"
+uri = "file://artifacts/bot-landing/public/stadium-hero.png"
+type = "image"
+title = "Stadium at night"
+
+[[generated]]
+id = "WXhbmGuh_KWWkuneth0bA"
+uri = "file://artifacts/bot-landing/public/tactics-hologram.png"
+type = "image"
+title = "Hologram football field"
