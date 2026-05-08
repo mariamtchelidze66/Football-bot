@@ -1,4 +1,5 @@
 import os
+import base64
 import logging
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -60,7 +61,17 @@ SYSTEM_PROMPT = (
     "1. Average yellow cards per game this season.\n"
     "2. Total yellow cards across their last 5 matches.\n"
     "Present these figures clearly in a dedicated section or alongside team statistics. "
-    "If the data is not available after searching, state that explicitly."
+    "If the data is not available after searching, state that explicitly.\n\n"
+    "IMAGE ANALYSIS RULE: When the user sends an image of a betslip or match statistics, "
+    "carefully read all text, odds, teams, markets, and selections visible in the image. "
+    "Then use your web search tool to look up current form, head-to-head records, injuries, "
+    "and any relevant statistics for the teams or events shown. "
+    "Provide a structured betting insight that covers: "
+    "(1) a summary of what the betslip or stats sheet contains, "
+    "(2) value assessment for each selection based on current odds vs your probability estimate, "
+    "(3) key risk factors such as injuries, suspensions, or poor recent form, "
+    "(4) an overall recommendation on whether the bet represents good value. "
+    "Be direct and analytical. Do not encourage reckless gambling — always note the inherent risk."
 )
 
 SCORES_PROMPT = (
@@ -330,6 +341,65 @@ async def run_agent_loop(
             return "\n".join(text_blocks).strip() or "I couldn't find any information on that."
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    caption = update.message.caption or "Analyse this image and provide detailed betting insights."
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        photo = update.message.photo[-1]
+        photo_file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await photo_file.download_as_bytearray()
+        photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
+
+        if user_id not in conversation_history:
+            conversation_history[user_id] = []
+
+        image_message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": photo_b64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": caption,
+                },
+            ],
+        }
+        conversation_history[user_id].append(image_message)
+
+        assistant_text = await run_agent_loop(user_id, update, context)
+
+        # Replace the image entry with a lightweight text placeholder so future
+        # conversation turns don't re-send the raw image bytes.
+        conversation_history[user_id][-1] = {
+            "role": "user",
+            "content": f"[Image sent] {caption}",
+        }
+        conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
+
+        if len(conversation_history[user_id]) > 40:
+            conversation_history[user_id] = conversation_history[user_id][-40:]
+
+        await send_reply(update, assistant_text)
+
+    except anthropic.APIError as e:
+        logger.error("Anthropic API error processing photo: %s", e)
+        await update.message.reply_text(
+            "Sorry, I encountered an error analysing that image. Please try again."
+        )
+    except Exception as e:
+        logger.error("Unexpected error processing photo: %s", e)
+        await update.message.reply_text("Sorry, I couldn't process that image. Please try again.")
+
+
 async def send_reply(update: Update, text: str) -> None:
     MAX_LENGTH = 4096
     if len(text) <= MAX_LENGTH:
@@ -351,6 +421,7 @@ def main() -> None:
     app.add_handler(CommandHandler("leagues", leagues_command))
     app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(
