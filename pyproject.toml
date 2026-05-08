@@ -5,5 +5,5 @@ description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.100.0",
-    "python-telegram-bot>=22.7",
+    "python-telegram-bot[job-queue]>=22.7",
 ]
