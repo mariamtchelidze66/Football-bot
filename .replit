@@ -24,12 +24,12 @@ args = "Telegram Bot"
 name = "Telegram Bot"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python telegram-bot/bot.py"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pkill -f 'python telegram-bot/bot.py' 2>/dev/null; sleep 3; python telegram-bot/bot.py"
 
 [agent]
 stack = "PNPM_WORKSPACE"
@@ -46,6 +46,10 @@ externalPort = 8080
 [[ports]]
 localPort = 8081
 externalPort = 80
+
+[[ports]]
+localPort = 8082
+externalPort = 3000
 
 [nix]
 channel = "stable-25_05"
