@@ -289,7 +289,7 @@ async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
     while True:
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=1024,
             system=SCORES_PROMPT,
             tools=[WEB_SEARCH_TOOL],
@@ -406,7 +406,7 @@ async def claude_fetch_json(prompt: str) -> dict | list:
     while True:
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=2048,
             system=FETCH_SYSTEM,
             tools=[WEB_SEARCH_TOOL],
@@ -670,7 +670,7 @@ async def run_agent_loop(
             try:
                 response = await asyncio.to_thread(
                     client.messages.create,
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-5",
                     max_tokens=8192,
                     system=SYSTEM_PROMPT,
                     tools=[WEB_SEARCH_TOOL],
