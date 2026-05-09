@@ -64,14 +64,20 @@ LEAGUES: dict[str, str] = {
 SCORE_UPDATE_INTERVAL = 30 * 60
 
 SYSTEM_PROMPT = (
+    "CRITICAL RULE — READ THIS FIRST:\n"
+    "You MUST use the web_search tool before writing ANY response that involves football facts, "
+    "matches, scores, teams, players, injuries, lineups, standings, transfers, or news. "
+    "NEVER ask the user for more details. NEVER say you need more information. "
+    "NEVER answer from memory alone. If the user's question is about football, "
+    "search immediately — even if the question seems vague. Make a reasonable search query "
+    "based on what they asked and fetch the live data first. "
+    "Only after searching may you write your response.\n\n"
     "You are a knowledgeable football (soccer) assistant with real-time web search capability. "
     "You specialise in providing up-to-date football news, live scores, match results, "
     "injury updates, team news, transfer rumours, fixtures, standings, and player statistics. "
     "You cover all major leagues and competitions worldwide (Premier League, La Liga, "
     "Serie A, Bundesliga, Ligue 1, Champions League, World Cup, etc.). "
-    "When asked about recent events, match results, injuries, or any current football news, "
-    "always use your web search tool to retrieve the latest information before responding. "
-    "Present information in a clear, structured way. If scores or news are unavailable, say so honestly.\n\n"
+    "Present information in a clear, structured way. If scores or news are unavailable after searching, say so honestly.\n\n"
     "MANDATORY SOURCE CITATION RULE — THIS OVERRIDES EVERYTHING ELSE:\n"
     "Every single sentence in your response that contains a factual claim MUST end with the source "
     "in parentheses, for example: "
@@ -652,8 +658,13 @@ async def run_agent_loop(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> str:
     loop_messages = list(conversation_history[user_id])
+    first_call = True
 
     while True:
+        # Force a tool call on the first turn so Haiku always searches before responding.
+        # After tool results are in, revert to auto so it can write the final answer.
+        tool_choice = {"type": "any"} if first_call else {"type": "auto"}
+
         for attempt in range(4):
             try:
                 response = await asyncio.to_thread(
@@ -662,6 +673,7 @@ async def run_agent_loop(
                     max_tokens=8192,
                     system=SYSTEM_PROMPT,
                     tools=[WEB_SEARCH_TOOL],
+                    tool_choice=tool_choice,
                     messages=loop_messages,
                 )
                 break
@@ -697,6 +709,7 @@ async def run_agent_loop(
                 for b in tool_use_blocks
             ]
             loop_messages.append({"role": "user", "content": tool_results})
+            first_call = False
 
         else:
             text_blocks = [b.text for b in response.content if b.type == "text"]
