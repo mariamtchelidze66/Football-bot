@@ -784,8 +784,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Update %s caused error: %s", update, context.error)
 
 
+HEALTH_PORT = 8765
+
+
+async def health_server() -> None:
+    """Minimal asyncio HTTP server that responds 200 OK to any GET /health request."""
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read(1024)
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "0.0.0.0", HEALTH_PORT)
+    logger.info("Health server listening on port %d", HEALTH_PORT)
+    async with server:
+        await server.serve_forever()
+
+
+async def post_init(application: Application) -> None:
+    asyncio.create_task(health_server())
+
+
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))

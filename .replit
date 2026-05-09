@@ -24,12 +24,12 @@ args = "Telegram Bot"
 name = "Telegram Bot"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python telegram-bot/bot.py"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python telegram-bot/watchdog.py"
 
 [agent]
 stack = "PNPM_WORKSPACE"
@@ -49,6 +49,10 @@ externalPort = 8080
 [[ports]]
 localPort = 8081
 externalPort = 8081
+
+[[ports]]
+localPort = 8765
+externalPort = 3000
 
 [[ports]]
 localPort = 20341
