@@ -63,6 +63,10 @@ LEAGUES: dict[str, str] = {
 
 SCORE_UPDATE_INTERVAL = 30 * 60
 
+# Serialises all Claude API requests so only one is in-flight at a time.
+# Initialised inside the bot's event loop via post_init.
+_queue_lock: asyncio.Lock | None = None
+
 SYSTEM_PROMPT = (
     "CRITICAL RULE — READ THIS FIRST:\n"
     "You MUST use the web_search tool before writing ANY response that involves football facts, "
@@ -285,7 +289,7 @@ async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
     while True:
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-20250514",
             max_tokens=1024,
             system=SCORES_PROMPT,
             tools=[WEB_SEARCH_TOOL],
@@ -402,7 +406,7 @@ async def claude_fetch_json(prompt: str) -> dict | list:
     while True:
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-20250514",
             max_tokens=2048,
             system=FETCH_SYSTEM,
             tools=[WEB_SEARCH_TOOL],
@@ -619,26 +623,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         conversation_history[user_id].append({"role": "user", "content": user_text})
 
+    # Start typing immediately so the user sees activity even while waiting in queue.
     typing_task = asyncio.create_task(
         keep_typing(update.effective_chat.id, context.bot)
     )
 
     try:
-        assistant_text = await run_agent_loop(user_id, update, context)
+        async with _queue_lock:
+            assistant_text = await run_agent_loop(user_id, update, context)
 
-        # Replace enriched entry with the original user text to keep history clean
-        conversation_history[user_id][-1] = {"role": "user", "content": user_text}
-        conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
+            # Replace enriched entry with the original user text to keep history clean
+            conversation_history[user_id][-1] = {"role": "user", "content": user_text}
+            conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
 
-        if len(conversation_history[user_id]) > 40:
-            conversation_history[user_id] = conversation_history[user_id][-40:]
+            if len(conversation_history[user_id]) > 40:
+                conversation_history[user_id] = conversation_history[user_id][-40:]
 
         await send_reply(update, assistant_text)
 
     except anthropic.RateLimitError:
         logger.error("Rate limit exhausted after all retries for user %d", user_id)
         await update.message.reply_text(
-            "Sorry, Claude is overloaded right now and couldn't respond after several retries. Please try again in a few minutes."
+            "Sorry, Claude is overloaded right now. Please try again in a few minutes."
         )
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
@@ -658,36 +664,29 @@ async def run_agent_loop(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> str:
     loop_messages = list(conversation_history[user_id])
-    first_call = True
 
     while True:
-        # Force a tool call on the first turn so Haiku always searches before responding.
-        # After tool results are in, revert to auto so it can write the final answer.
-        tool_choice = {"type": "any"} if first_call else {"type": "auto"}
-
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 response = await asyncio.to_thread(
                     client.messages.create,
-                    model="claude-haiku-4-5-20251001",
+                    model="claude-sonnet-4-20250514",
                     max_tokens=8192,
                     system=SYSTEM_PROMPT,
                     tools=[WEB_SEARCH_TOOL],
-                    tool_choice=tool_choice,
                     messages=loop_messages,
                 )
                 break
             except anthropic.RateLimitError:
-                wait = 60 * (attempt + 1)
-                logger.warning("Rate limited, waiting %ds (attempt %d/4)", wait, attempt + 1)
+                if attempt == 2:
+                    raise
+                logger.warning("Rate limited — waiting 60 s before retry %d/2", attempt + 1)
                 if attempt == 0:
                     await context.bot.send_message(
                         chat_id=update.effective_chat.id,
-                        text="⏳ Claude is busy right now — retrying in about a minute, please hang on…"
+                        text="⏳ Claude is rate limited right now — retrying in 60 seconds, please hang on…"
                     )
-                if attempt == 3:
-                    raise
-                await asyncio.sleep(wait)
+                await asyncio.sleep(60)
         else:
             raise RuntimeError("Exhausted retries")
 
@@ -752,25 +751,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         }
         conversation_history[user_id].append(image_message)
 
-        assistant_text = await run_agent_loop(user_id, update, context)
+        async with _queue_lock:
+            assistant_text = await run_agent_loop(user_id, update, context)
 
-        # Replace the image entry with a lightweight text placeholder so future
-        # conversation turns don't re-send the raw image bytes.
-        conversation_history[user_id][-1] = {
-            "role": "user",
-            "content": f"[Image sent] {caption}",
-        }
-        conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
+            # Replace the image entry with a lightweight text placeholder so future
+            # conversation turns don't re-send the raw image bytes.
+            conversation_history[user_id][-1] = {
+                "role": "user",
+                "content": f"[Image sent] {caption}",
+            }
+            conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
 
-        if len(conversation_history[user_id]) > 40:
-            conversation_history[user_id] = conversation_history[user_id][-40:]
+            if len(conversation_history[user_id]) > 40:
+                conversation_history[user_id] = conversation_history[user_id][-40:]
 
         await send_reply(update, assistant_text)
 
     except anthropic.RateLimitError:
         logger.error("Rate limit exhausted after all retries for photo from user %d", user_id)
         await update.message.reply_text(
-            "Sorry, Claude is overloaded right now and couldn't analyse the image after several retries. Please try again in a few minutes."
+            "Sorry, Claude is overloaded right now. Please try again in a few minutes."
         )
     except anthropic.APIError as e:
         logger.error("Anthropic API error processing photo: %s", e)
@@ -819,6 +819,8 @@ async def health_server() -> None:
 
 
 async def post_init(application: Application) -> None:
+    global _queue_lock
+    _queue_lock = asyncio.Lock()
     asyncio.create_task(health_server())
 
 
