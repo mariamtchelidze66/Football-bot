@@ -1,8 +1,11 @@
 import os
+import json
 import asyncio
 import base64
 import logging
-from datetime import datetime, timezone
+import urllib.request
+import urllib.parse
+from datetime import datetime, time as dt_time, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -30,6 +33,18 @@ conversation_history: dict[int, list[dict]] = {}
 subscriptions: dict[int, set[str]] = {}
 
 last_scores: dict[str, str] = {}
+
+match_cache: dict[str, dict[str, dict]] = {}
+CACHE_MAX_AGE_HOURS = 6
+
+PL_TEAMS = [
+    "arsenal", "aston villa", "bournemouth", "brentford", "brighton",
+    "chelsea", "crystal palace", "everton", "fulham", "ipswich",
+    "leicester", "liverpool", "manchester city", "man city",
+    "manchester united", "man united", "man utd", "newcastle",
+    "nottingham forest", "forest", "southampton", "tottenham", "spurs",
+    "west ham", "wolves", "wolverhampton",
+]
 
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 
@@ -83,6 +98,11 @@ SYSTEM_PROMPT = (
     "NEVER estimate or guess weather from general knowledge — always fetch the live wttr.in URL.\n\n"
     "Present each section clearly with a heading. "
     "If any data point is unavailable after fetching, state that explicitly rather than omitting the section.\n\n"
+    "CACHE RULE: When a user's message begins with a block marked '=== CACHED MATCH DATA: ...' "
+    "this is pre-fetched data retrieved at 7am — treat it as your primary source. "
+    "Present the cached data clearly in your response, always noting the source and when it was last updated. "
+    "You may supplement with live web searches for anything not covered or if the user asks for latest updates. "
+    "If a cached field says 'Could not find from trusted sources', acknowledge that in your response.\n\n"
     "INJURY & LINEUP RULE: When reporting injury or lineup information, you MUST only use these trusted sources, searched in this order:\n"
     "1. BBC Sport (bbc.com/sport)\n"
     "2. Sky Sports (skysports.com)\n"
@@ -112,6 +132,17 @@ SCORES_PROMPT = (
     "Home Team X - Y Away Team\n"
     "One match per line, no extra commentary, no markdown. "
     "If no matches have been completed recently, reply with exactly: NO_RECENT_MATCHES"
+)
+
+FETCH_SYSTEM = (
+    "You are a football data researcher with web search capability. "
+    "Search the specified sources and return ONLY valid JSON — no markdown, no code fences, no commentary. "
+    "For injury/lineup data use ONLY: BBC Sport, Sky Sports, The Athletic, "
+    "Premier League official site, or club official websites. "
+    "For statistics use: Sofascore, FBref.com, BBC Sport, Sky Sports. "
+    "Always include a 'source' field naming the exact website the data came from. "
+    "If data cannot be found from the specified trusted sources, set the value to "
+    "'Could not find from trusted sources'."
 )
 
 
@@ -294,6 +325,245 @@ async def score_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error("Error fetching scores for %s: %s", league_key, e)
 
 
+# ─── Cache helpers ────────────────────────────────────────────────────────────
+
+def _cache_key(home: str, away: str) -> str:
+    return f"{home.strip().lower()}_vs_{away.strip().lower()}"
+
+
+def is_cache_fresh(fetched_at_iso: str) -> bool:
+    fetched_at = datetime.fromisoformat(fetched_at_iso)
+    age = datetime.now(timezone.utc) - fetched_at
+    return age.total_seconds() < CACHE_MAX_AGE_HOURS * 3600
+
+
+def _wttr_blocking(city: str) -> dict:
+    """Blocking wttr.in fetch — called via asyncio.to_thread."""
+    url = f"https://wttr.in/{urllib.parse.quote(city)}?format=j1"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    cond = data["current_condition"][0]
+    today_weather = data.get("weather", [{}])[0]
+    hourly = today_weather.get("hourly", [{}])
+    rain_chance = hourly[0].get("chanceofrain", "N/A") if hourly else "N/A"
+    return {
+        "temperature_c": cond["temp_C"],
+        "wind_kmph": cond["windspeedKmph"],
+        "rain_chance_pct": rain_chance,
+        "description": cond["weatherDesc"][0]["value"],
+        "source": "wttr.in",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def fetch_weather(city: str) -> dict:
+    try:
+        return await asyncio.to_thread(_wttr_blocking, city)
+    except Exception as e:
+        logger.warning("wttr.in fetch failed for %s: %s", city, e)
+        return {
+            "error": str(e),
+            "source": "wttr.in",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+async def claude_fetch_json(prompt: str) -> dict | list:
+    """Run Claude + web search agentic loop expecting a JSON response."""
+    loop_msgs = [{"role": "user", "content": prompt}]
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=FETCH_SYSTEM,
+            tools=[WEB_SEARCH_TOOL],
+            messages=loop_msgs,
+        )
+        if response.stop_reason == "tool_use":
+            tool_blocks = [b for b in response.content if b.type == "tool_use"]
+            loop_msgs.append({
+                "role": "assistant",
+                "content": [b.model_dump() for b in response.content],
+            })
+            loop_msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": b.id, "content": ""}
+                for b in tool_blocks
+            ]})
+        else:
+            text = "\n".join(b.text for b in response.content if b.type == "text").strip()
+            if "```" in text:
+                parts = text.split("```")
+                text = parts[1] if len(parts) > 1 else parts[0]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning("claude_fetch_json: JSON parse failed: %s", text[:200])
+                return {"parse_error": True, "raw": text,
+                        "updated_at": datetime.now(timezone.utc).isoformat()}
+
+
+async def fetch_pl_fixtures_today() -> list[dict]:
+    """Fetch today's Premier League fixtures as a list of match dicts."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    result = await claude_fetch_json(
+        f"Search premierleague.com and BBC Sport for ALL Premier League matches "
+        f"scheduled for today ({today}). Return a JSON array where each element has: "
+        '"home_team", "away_team", "kickoff_utc", "stadium", "city". '
+        "If there are no matches today, return an empty array []."
+    )
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("matches", "fixtures", "games"):
+            if key in result and isinstance(result[key], list):
+                return result[key]
+    return []
+
+
+async def fetch_match_details(home: str, away: str, city: str, kickoff: str) -> dict:
+    """Fetch lineups, injuries, referee stats, and card stats for one match."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    details_prompt = (
+        f"Search for detailed information about {home} vs {away} on {today} "
+        f"(kickoff {kickoff}). Search BBC Sport, Sky Sports, The Athletic, "
+        f"premierleague.com, Sofascore, and FBref.com. "
+        "Return a single JSON object with exactly these fields:\n"
+        '"lineups": expected/confirmed lineups for both teams (source field required)\n'
+        '"injuries": injury and suspension lists for both teams (source field required, '
+        'use trusted sources only: BBC Sport, Sky Sports, The Athletic, premierleague.com, club sites)\n'
+        '"referee": {"name", "yellows_per_game_season", "red_cards_season", "penalties_season", "source"}\n'
+        '"home_discipline": {"avg_yellows_per_game", "yellows_last_5_matches", "source"}\n'
+        '"away_discipline": {"avg_yellows_per_game", "yellows_last_5_matches", "source"}\n'
+    )
+
+    details, weather = await asyncio.gather(
+        claude_fetch_json(details_prompt),
+        fetch_weather(city),
+    )
+
+    if not isinstance(details, dict):
+        details = {}
+
+    return {
+        "home_team": home,
+        "away_team": away,
+        "city": city,
+        "kickoff_utc": kickoff,
+        "fetched_at": now_iso,
+        "lineups": details.get("lineups", {"note": "Not available", "source": "N/A"}),
+        "injuries": details.get("injuries", {"note": "Could not find from trusted sources", "source": "N/A"}),
+        "referee": details.get("referee", {"note": "Not available", "source": "N/A"}),
+        "home_discipline": details.get("home_discipline", {"note": "Not available", "source": "N/A"}),
+        "away_discipline": details.get("away_discipline", {"note": "Not available", "source": "N/A"}),
+        "weather": weather,
+    }
+
+
+async def morning_cache_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """7am daily job: pre-fetch and cache all Premier League match data."""
+    logger.info("Morning cache job: fetching today's Premier League fixtures")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    try:
+        fixtures = await fetch_pl_fixtures_today()
+    except Exception as e:
+        logger.error("Morning cache job: failed to fetch fixtures: %s", e)
+        return
+
+    if not fixtures:
+        logger.info("Morning cache job: no PL matches today")
+        return
+
+    logger.info("Morning cache job: found %d fixture(s), fetching details", len(fixtures))
+    match_cache.setdefault(today, {})
+
+    for fixture in fixtures:
+        home = fixture.get("home_team", "").strip()
+        away = fixture.get("away_team", "").strip()
+        city = fixture.get("city", "").strip()
+        kickoff = fixture.get("kickoff_utc", "TBD")
+        if not home or not away:
+            continue
+        try:
+            key = _cache_key(home, away)
+            logger.info("Morning cache job: fetching %s vs %s", home, away)
+            match_cache[today][key] = await fetch_match_details(home, away, city, kickoff)
+            logger.info("Morning cache job: cached %s vs %s", home, away)
+        except Exception as e:
+            logger.error("Morning cache job: failed for %s vs %s: %s", home, away, e)
+
+
+def find_cached_match(user_text: str) -> dict | None:
+    """Return fresh cached match data if the user mentions one of today's matches."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_matches = match_cache.get(today, {})
+    if not today_matches:
+        return None
+    text_lower = user_text.lower()
+    for data in today_matches.values():
+        home = data.get("home_team", "").lower()
+        away = data.get("away_team", "").lower()
+        if (home and home in text_lower) or (away and away in text_lower):
+            fetched_at = data.get("fetched_at", "")
+            if fetched_at and is_cache_fresh(fetched_at):
+                return data
+    return None
+
+
+def format_cache_context(data: dict) -> str:
+    """Format cached match data as a readable preamble for Claude."""
+    home = data.get("home_team", "Home")
+    away = data.get("away_team", "Away")
+    fetched_at = data.get("fetched_at", "unknown")
+    kickoff = data.get("kickoff_utc", "TBD")
+
+    def fmt(title: str, content) -> str:
+        if isinstance(content, dict):
+            source = content.get("source", "N/A")
+            lines = [f"[CACHED — {title}] (Source: {source}, Last updated: {fetched_at})"]
+            for k, v in content.items():
+                if k != "source":
+                    lines.append(f"  {k}: {v}")
+            return "\n".join(lines)
+        return f"[CACHED — {title}] {content} (Last updated: {fetched_at})"
+
+    weather = data.get("weather", {})
+    weather_line = (
+        f"  Temperature: {weather.get('temperature_c')}°C, "
+        f"Wind: {weather.get('wind_kmph')} km/h, "
+        f"Rain chance: {weather.get('rain_chance_pct')}%, "
+        f"Conditions: {weather.get('description')}"
+    )
+
+    return "\n".join([
+        f"=== CACHED MATCH DATA: {home} vs {away} (Kickoff: {kickoff}) ===",
+        f"Pre-fetched at 7am UTC — Last updated: {fetched_at}",
+        "",
+        f"[CACHED — WEATHER] (Source: wttr.in, Last updated: {fetched_at})",
+        weather_line,
+        "",
+        fmt("LINEUPS", data.get("lineups", {})),
+        "",
+        fmt("INJURIES", data.get("injuries", {})),
+        "",
+        fmt("REFEREE", data.get("referee", {})),
+        "",
+        fmt("HOME DISCIPLINE", data.get("home_discipline", {})),
+        "",
+        fmt("AWAY DISCIPLINE", data.get("away_discipline", {})),
+        "",
+        "=== END CACHED DATA — supplement with live search if needed ===",
+    ])
+
+
+# ─── Typing indicator ─────────────────────────────────────────────────────────
+
 async def keep_typing(chat_id: int, bot) -> None:
     """Send a typing action every 4 seconds until cancelled."""
     try:
@@ -311,7 +581,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
-    conversation_history[user_id].append({"role": "user", "content": user_text})
+    # Inject cached match data if available and fresh
+    cached = find_cached_match(user_text)
+    if cached:
+        enriched = f"{format_cache_context(cached)}\n\nUser question: {user_text}"
+        conversation_history[user_id].append({"role": "user", "content": enriched})
+        logger.info("Cache hit for user %d: %s vs %s",
+                    user_id, cached.get("home_team"), cached.get("away_team"))
+    else:
+        conversation_history[user_id].append({"role": "user", "content": user_text})
 
     typing_task = asyncio.create_task(
         keep_typing(update.effective_chat.id, context.bot)
@@ -320,6 +598,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         assistant_text = await run_agent_loop(user_id, update, context)
 
+        # Replace enriched entry with the original user text to keep history clean
+        conversation_history[user_id][-1] = {"role": "user", "content": user_text}
         conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
 
         if len(conversation_history[user_id]) > 40:
@@ -470,6 +750,11 @@ def main() -> None:
         score_update_job,
         interval=SCORE_UPDATE_INTERVAL,
         first=60,
+    )
+
+    app.job_queue.run_daily(
+        morning_cache_job,
+        time=dt_time(hour=7, minute=0, tzinfo=timezone.utc),
     )
 
     logger.info("Bot is starting with web search and league subscriptions enabled...")
