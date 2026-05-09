@@ -3,7 +3,8 @@ Watchdog for the Telegram bot.
 
 - Starts bot.py as a subprocess.
 - Restarts it automatically if it crashes (5 s cool-down).
-- Pings the health endpoint every 5 minutes and restarts if it fails twice in a row.
+- Pings the health endpoint every 60 seconds and restarts if it fails twice in a row
+  (i.e. bot is restarted within 2 minutes of becoming unresponsive).
 """
 import logging
 import os
@@ -20,10 +21,10 @@ logging.basicConfig(
 logger = logging.getLogger("watchdog")
 
 HEALTH_URL = "http://localhost:8765/health"
-CHECK_INTERVAL = 300        # seconds between health pings (5 min)
+CHECK_INTERVAL = 60         # seconds between health pings (1 min)
 STARTUP_GRACE = 20          # seconds to wait after start before first health check
 CRASH_COOLDOWN = 5          # seconds to wait before restarting after a crash
-MAX_CONSECUTIVE_FAILS = 2   # failed pings before forcing a restart
+MAX_CONSECUTIVE_FAILS = 2   # 2 failed pings × 60 s = restart within 2 minutes
 
 BOT_CMD = [sys.executable, "telegram-bot/bot.py"]
 
