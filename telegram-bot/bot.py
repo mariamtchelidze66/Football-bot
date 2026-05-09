@@ -25,17 +25,35 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ALLSPORTS_API_KEY = os.environ.get("ALLSPORTS_API_KEY", "")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ─── In-memory state ──────────────────────────────────────────────────────────
+
 conversation_history: dict[int, list[dict]] = {}
-
 subscriptions: dict[int, set[str]] = {}
-
 last_scores: dict[str, str] = {}
-
 match_cache: dict[str, dict[str, dict]] = {}
 CACHE_MAX_AGE_HOURS = 6
+
+# ─── AllSports API ────────────────────────────────────────────────────────────
+
+ALLSPORTS_BASE = "https://apiv2.allsportsapi.com/football/"
+
+# Internal league key → AllSports league ID
+ALLSPORTS_LEAGUE_IDS: dict[str, int] = {
+    "england_pl":    148,
+    "spain_laliga":  302,
+    "italy_serie_a": 207,
+    "germany_buli":   78,
+    "france_ligue1": 168,
+    "uefa_cl":       175,
+    "uefa_el":         5,
+    "uefa_conf":    1271,
+    "usa_mls":        43,
+    "brazil_serie_a": 35,
+}
 
 PL_TEAMS = [
     "arsenal", "aston villa", "bournemouth", "brentford", "brighton",
@@ -64,8 +82,128 @@ LEAGUES: dict[str, str] = {
 SCORE_UPDATE_INTERVAL = 30 * 60
 
 # Serialises all Claude API requests so only one is in-flight at a time.
-# Initialised inside the bot's event loop via post_init.
 _queue_lock: asyncio.Lock | None = None
+
+# ─── AllSports API helpers ────────────────────────────────────────────────────
+
+def _allsports_get_blocking(params: dict) -> dict:
+    """Blocking AllSports API call — run via asyncio.to_thread."""
+    p = {"APIkey": ALLSPORTS_API_KEY, **params}
+    resp = _requests.get(ALLSPORTS_BASE, params=p, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if str(data.get("success")) == "0" or data.get("error"):
+        raise ValueError(f"AllSports API error: {data}")
+    return data
+
+
+async def allsports_get(params: dict) -> dict:
+    return await asyncio.to_thread(_allsports_get_blocking, params)
+
+
+async def allsports_fixtures(league_id: int, date: str) -> list[dict]:
+    """Fetch fixtures for a given league and date (YYYY-MM-DD)."""
+    if not ALLSPORTS_API_KEY:
+        return []
+    try:
+        data = await allsports_get({
+            "met": "Fixtures",
+            "leagueId": league_id,
+            "from": date,
+            "to": date,
+        })
+        return data.get("result") or []
+    except Exception as e:
+        logger.warning("AllSports fixtures failed (leagueId=%d): %s", league_id, e)
+        return []
+
+
+async def allsports_live_scores(league_id: int | None = None) -> list[dict]:
+    """Fetch live/in-progress scores, optionally filtered by league."""
+    if not ALLSPORTS_API_KEY:
+        return []
+    try:
+        params: dict = {"met": "Livescore"}
+        if league_id:
+            params["leagueId"] = league_id
+        data = await allsports_get(params)
+        return data.get("result") or []
+    except Exception as e:
+        logger.warning("AllSports livescores failed: %s", e)
+        return []
+
+
+async def allsports_standings(league_id: int) -> list[dict]:
+    """Fetch standings table rows for a league."""
+    if not ALLSPORTS_API_KEY:
+        return []
+    try:
+        data = await allsports_get({"met": "Standings", "leagueId": league_id})
+        result = data.get("result") or []
+        if result and isinstance(result[0], dict):
+            return result[0].get("league_round") or []
+        return []
+    except Exception as e:
+        logger.warning("AllSports standings failed (leagueId=%d): %s", league_id, e)
+        return []
+
+
+async def allsports_lineups(match_id: str | int) -> dict:
+    """Fetch confirmed/expected lineups for a match."""
+    if not ALLSPORTS_API_KEY:
+        return {}
+    try:
+        data = await allsports_get({"met": "Lineups", "matchId": match_id})
+        return data.get("result") or {}
+    except Exception as e:
+        logger.warning("AllSports lineups failed (matchId=%s): %s", match_id, e)
+        return {}
+
+
+def _is_finished(status: str) -> bool:
+    return status.lower() in {"finished", "ft", "aet", "pen", "90+", "90"}
+
+
+def _is_live(status: str) -> bool:
+    return status.lower() in {"1h", "2h", "ht", "et", "live", "pen"}
+
+
+def format_allsports_scores(fixtures: list[dict]) -> str | None:
+    """Format a list of AllSports fixture dicts into a compact score summary."""
+    live_lines = []
+    finished_lines = []
+    for f in fixtures:
+        home = f.get("event_home_team", "?")
+        away = f.get("event_away_team", "?")
+        score = f.get("event_final_result") or f.get("event_score") or "- vs -"
+        status = str(f.get("event_status", ""))
+        if _is_live(status):
+            live_lines.append(f"🔴 {home} {score} {away} ({status}')")
+        elif _is_finished(status):
+            finished_lines.append(f"✅ {home} {score} {away}")
+    all_lines = live_lines + finished_lines
+    return "\n".join(all_lines) if all_lines else None
+
+
+def format_allsports_standings(rows: list[dict], league_name: str) -> str:
+    """Format standings rows into a readable Markdown table."""
+    if not rows:
+        return f"No standings data available for {league_name}."
+    header = f"📊 *{league_name} Standings* (Source: AllSports API)\n\n"
+    header += "`Pos  Team                  P   W  D  L  Pts`\n"
+    lines = []
+    for row in rows:
+        pos  = str(row.get("standing_place", "?")).ljust(4)
+        team = str(row.get("standing_team", "?"))[:21].ljust(21)
+        p    = str(row.get("standing_P", "?")).ljust(3)
+        w    = str(row.get("standing_W", "?")).ljust(3)
+        d    = str(row.get("standing_D", "?")).ljust(3)
+        l    = str(row.get("standing_L", "?")).ljust(3)
+        pts  = str(row.get("standing_pts", "?"))
+        lines.append(f"`{pos} {team} {p} {w} {d} {l} {pts}`")
+    return header + "\n".join(lines)
+
+# ─── Prompts ──────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
     "CRITICAL RULE — READ THIS FIRST:\n"
@@ -76,6 +214,13 @@ SYSTEM_PROMPT = (
     "search immediately — even if the question seems vague. Make a reasonable search query "
     "based on what they asked and fetch the live data first. "
     "Only after searching may you write your response.\n\n"
+    "ALLSPORTS API DATA RULE:\n"
+    "When a user's message begins with a block marked '=== ALLSPORTS DATA: ...' or "
+    "'=== CACHED MATCH DATA: ...' this contains live structured data fetched directly "
+    "from the AllSports API or pre-fetched at 7am. This is your most reliable source "
+    "for scores, fixtures, and standings — always cite it as '(Source: AllSports API)'. "
+    "You may still use web_search to supplement it with injuries, lineups from trusted "
+    "sources, referee information, weather, and transfer news.\n\n"
     "You are a knowledgeable football (soccer) assistant with real-time web search capability. "
     "You specialise in providing up-to-date football news, live scores, match results, "
     "injury updates, team news, transfer rumours, fixtures, standings, and player statistics. "
@@ -85,7 +230,7 @@ SYSTEM_PROMPT = (
     "MANDATORY SOURCE CITATION RULE — THIS OVERRIDES EVERYTHING ELSE:\n"
     "Every single sentence in your response that contains a factual claim MUST end with the source "
     "in parentheses, for example: "
-    "'Liverpool are 4th with 58 points (Source: Premier League official website).' "
+    "'Liverpool are 4th with 58 points (Source: AllSports API).' "
     "'Salah has scored 22 goals this season (Source: Sofascore).' "
     "'The match kicks off at 17:30 BST (Source: BBC Sport).'\n"
     "This rule applies to EVERY sentence — standings, scores, statistics, injuries, lineups, "
@@ -100,11 +245,12 @@ SYSTEM_PROMPT = (
     "you MUST always include ALL of the following sections, each sourced via web search:\n\n"
     "SOURCE PRIORITY FOR MATCH STATISTICS:\n"
     "Always fetch match statistics in this strict priority order, moving to the next only if the previous is unavailable:\n"
-    "1. Sofascore (search for the match on sofascore.com)\n"
-    "2. FBref.com (search fbref.com for the teams/match)\n"
-    "3. BBC Sport (search bbc.com/sport)\n"
-    "4. Sky Sports (search skysports.com)\n"
-    "You MUST state which source each statistic or data point came from, e.g. '(Source: Sofascore)' or '(Source: FBref.com)'.\n\n"
+    "1. AllSports API data (if pre-injected in the message)\n"
+    "2. Sofascore (search for the match on sofascore.com)\n"
+    "3. FBref.com (search fbref.com for the teams/match)\n"
+    "4. BBC Sport (search bbc.com/sport)\n"
+    "5. Sky Sports (search skysports.com)\n"
+    "You MUST state which source each statistic or data point came from.\n\n"
     "DISCIPLINE STATS (per team):\n"
     "1. Average yellow cards per game this season.\n"
     "2. Total yellow cards across their last 5 matches.\n\n"
@@ -126,11 +272,6 @@ SYSTEM_PROMPT = (
     "NEVER estimate or guess weather — always fetch live data from one of these two URLs.\n\n"
     "Present each section clearly with a heading. "
     "If any data point is unavailable after fetching, state that explicitly rather than omitting the section.\n\n"
-    "CACHE RULE: When a user's message begins with a block marked '=== CACHED MATCH DATA: ...' "
-    "this is pre-fetched data retrieved at 7am — treat it as your primary source. "
-    "Present the cached data clearly in your response, always noting the source and when it was last updated. "
-    "You may supplement with live web searches for anything not covered or if the user asks for latest updates. "
-    "If a cached field says 'Could not find from trusted sources', acknowledge that in your response.\n\n"
     "PREDICTED LINEUP & TACTICAL ANALYSIS RULE:\n"
     "When providing predicted lineups or any tactical analysis, you MUST search ONLY these four sources, in this order:\n"
     "1. BBC Sport (bbc.com/sport)\n"
@@ -179,6 +320,7 @@ FETCH_SYSTEM = (
     "If other data cannot be found, set the value to 'Could not find from trusted sources'."
 )
 
+# ─── Telegram keyboard ────────────────────────────────────────────────────────
 
 def build_leagues_keyboard(user_id: int) -> InlineKeyboardMarkup:
     user_subs = subscriptions.get(user_id, set())
@@ -189,6 +331,7 @@ def build_leagues_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton("✔️ Done", callback_data="league_done")])
     return InlineKeyboardMarkup(buttons)
 
+# ─── Command handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -277,9 +420,11 @@ async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=build_leagues_keyboard(user_id),
         )
 
+# ─── Score fetching (AllSports primary, web search fallback) ──────────────────
 
-async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
-    messages = [{
+async def _fetch_league_scores_via_search(league_name: str) -> str | None:
+    """Fallback: use Claude web search to get recent scores."""
+    loop_messages = [{
         "role": "user",
         "content": (
             f"Search for the latest completed match results for {league_name} today "
@@ -287,9 +432,6 @@ async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
             "List only finished matches with their scores."
         ),
     }]
-
-    loop_messages = list(messages)
-
     while True:
         response = await asyncio.to_thread(
             client.messages.create,
@@ -299,24 +441,47 @@ async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
             tools=[WEB_SEARCH_TOOL],
             messages=loop_messages,
         )
-
         if response.stop_reason == "tool_use":
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
             loop_messages.append({
                 "role": "assistant",
                 "content": [b.model_dump() for b in response.content],
             })
-            tool_results = [
+            loop_messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": b.id, "content": ""}
                 for b in tool_use_blocks
-            ]
-            loop_messages.append({"role": "user", "content": tool_results})
+            ]})
         else:
             text_blocks = [b.text for b in response.content if b.type == "text"]
             result = "\n".join(text_blocks).strip()
             if not result or "NO_RECENT_MATCHES" in result:
                 return None
             return result
+
+
+async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
+    """
+    Fetch recent scores for a league.
+    Primary: AllSports API (live + fixtures).
+    Fallback: Claude web search.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    league_id = ALLSPORTS_LEAGUE_IDS.get(league_key)
+
+    if league_id and ALLSPORTS_API_KEY:
+        # Check live scores first, then today's fixtures
+        live, fixtures = await asyncio.gather(
+            allsports_live_scores(league_id),
+            allsports_fixtures(league_id, today),
+        )
+        combined = live + [f for f in fixtures if f.get("event_key") not in {l.get("event_key") for l in live}]
+        scores = format_allsports_scores(combined)
+        if scores:
+            logger.info("AllSports scores OK for %s (%d events)", league_key, len(combined))
+            return scores
+        logger.info("AllSports returned no scores for %s — falling back to web search", league_key)
+
+    return await _fetch_league_scores_via_search(league_name)
 
 
 async def score_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -358,7 +523,6 @@ async def score_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         except Exception as e:
             logger.error("Error fetching scores for %s: %s", league_key, e)
-
 
 # ─── Cache helpers ────────────────────────────────────────────────────────────
 
@@ -475,9 +639,10 @@ async def claude_fetch_json(prompt: str) -> dict | list:
                 return {"parse_error": True, "raw": text,
                         "updated_at": datetime.now(timezone.utc).isoformat()}
 
+# ─── Fixture fetching (AllSports primary, web search fallback) ────────────────
 
-async def fetch_pl_fixtures_today() -> list[dict]:
-    """Fetch today's Premier League fixtures as a list of match dicts."""
+async def _fetch_pl_fixtures_via_search() -> list[dict]:
+    """Fallback: use Claude web search to fetch today's PL fixtures."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     result = await claude_fetch_json(
         f"Search premierleague.com and BBC Sport for ALL Premier League matches "
@@ -494,8 +659,43 @@ async def fetch_pl_fixtures_today() -> list[dict]:
     return []
 
 
-async def fetch_match_details(home: str, away: str, city: str, kickoff: str) -> dict:
-    """Fetch lineups, injuries, referee stats, and card stats for one match."""
+async def fetch_pl_fixtures_today() -> list[dict]:
+    """
+    Fetch today's Premier League fixtures.
+    Primary: AllSports API.
+    Fallback: Claude web search.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pl_id = ALLSPORTS_LEAGUE_IDS["england_pl"]
+
+    if ALLSPORTS_API_KEY:
+        raw = await allsports_fixtures(pl_id, today)
+        if raw:
+            fixtures = []
+            for f in raw:
+                fixtures.append({
+                    "home_team":   f.get("event_home_team", "").strip(),
+                    "away_team":   f.get("event_away_team", "").strip(),
+                    "kickoff_utc": f.get("event_time", "TBD"),
+                    "stadium":     f.get("event_stadium", ""),
+                    "city":        f.get("event_city", ""),
+                    "match_id":    f.get("event_key"),
+                })
+            logger.info("AllSports: %d PL fixtures today", len(fixtures))
+            return fixtures
+        logger.info("AllSports returned no PL fixtures — falling back to web search")
+
+    return await _fetch_pl_fixtures_via_search()
+
+# ─── Match detail fetching (AllSports lineups + Claude for the rest) ──────────
+
+async def fetch_match_details(home: str, away: str, city: str, kickoff: str,
+                               match_id: str | int | None = None) -> dict:
+    """
+    Fetch lineups, injuries, referee stats, and card stats for one match.
+    Lineups: AllSports API primary, then Claude web search fallback.
+    Everything else: Claude web search (trusted sources only).
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -512,26 +712,35 @@ async def fetch_match_details(home: str, away: str, city: str, kickoff: str) -> 
         '"away_discipline": {"avg_yellows_per_game", "yellows_last_5_matches", "source"}\n'
     )
 
-    details, weather = await asyncio.gather(
+    # Run AllSports lineups (if match_id known) and Claude details fetch in parallel
+    allsports_lineup_task = allsports_lineups(match_id) if match_id else asyncio.sleep(0)  # type: ignore
+    details, weather, api_lineups = await asyncio.gather(
         claude_fetch_json(details_prompt),
         fetch_weather(city),
+        allsports_lineup_task if match_id else asyncio.coroutine(lambda: {})(),
     )
 
     if not isinstance(details, dict):
         details = {}
 
+    # Prefer AllSports lineups over web-searched ones when available
+    lineups = details.get("lineups", {"note": "Not available", "source": "N/A"})
+    if api_lineups and isinstance(api_lineups, dict) and api_lineups:
+        lineups = {**api_lineups, "source": "AllSports API"}
+
     return {
-        "home_team": home,
-        "away_team": away,
-        "city": city,
-        "kickoff_utc": kickoff,
-        "fetched_at": now_iso,
-        "lineups": details.get("lineups", {"note": "Not available", "source": "N/A"}),
-        "injuries": details.get("injuries", {"note": "Could not find from trusted sources", "source": "N/A"}),
-        "referee": details.get("referee", {"note": "Not available", "source": "N/A"}),
-        "home_discipline": details.get("home_discipline", {"note": "Not available", "source": "N/A"}),
-        "away_discipline": details.get("away_discipline", {"note": "Not available", "source": "N/A"}),
-        "weather": weather,
+        "home_team":        home,
+        "away_team":        away,
+        "city":             city,
+        "kickoff_utc":      kickoff,
+        "match_id":         match_id,
+        "fetched_at":       now_iso,
+        "lineups":          lineups,
+        "injuries":         details.get("injuries",         {"note": "Could not find from trusted sources", "source": "N/A"}),
+        "referee":          details.get("referee",          {"note": "Not available", "source": "N/A"}),
+        "home_discipline":  details.get("home_discipline",  {"note": "Not available", "source": "N/A"}),
+        "away_discipline":  details.get("away_discipline",  {"note": "Not available", "source": "N/A"}),
+        "weather":          weather,
     }
 
 
@@ -554,16 +763,17 @@ async def morning_cache_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     match_cache.setdefault(today, {})
 
     for fixture in fixtures:
-        home = fixture.get("home_team", "").strip()
-        away = fixture.get("away_team", "").strip()
-        city = fixture.get("city", "").strip()
-        kickoff = fixture.get("kickoff_utc", "TBD")
+        home     = fixture.get("home_team", "").strip()
+        away     = fixture.get("away_team", "").strip()
+        city     = fixture.get("city", "").strip()
+        kickoff  = fixture.get("kickoff_utc", "TBD")
+        match_id = fixture.get("match_id")
         if not home or not away:
             continue
         try:
             key = _cache_key(home, away)
-            logger.info("Morning cache job: fetching %s vs %s", home, away)
-            match_cache[today][key] = await fetch_match_details(home, away, city, kickoff)
+            logger.info("Morning cache job: fetching %s vs %s (id=%s)", home, away, match_id)
+            match_cache[today][key] = await fetch_match_details(home, away, city, kickoff, match_id)
             logger.info("Morning cache job: cached %s vs %s", home, away)
         except Exception as e:
             logger.error("Morning cache job: failed for %s vs %s: %s", home, away, e)
@@ -588,10 +798,11 @@ def find_cached_match(user_text: str) -> dict | None:
 
 def format_cache_context(data: dict) -> str:
     """Format cached match data as a readable preamble for Claude."""
-    home = data.get("home_team", "Home")
-    away = data.get("away_team", "Away")
+    home     = data.get("home_team", "Home")
+    away     = data.get("away_team", "Away")
     fetched_at = data.get("fetched_at", "unknown")
-    kickoff = data.get("kickoff_utc", "TBD")
+    kickoff  = data.get("kickoff_utc", "TBD")
+    match_id = data.get("match_id", "N/A")
 
     def fmt(title: str, content) -> str:
         if isinstance(content, dict):
@@ -612,7 +823,7 @@ def format_cache_context(data: dict) -> str:
     )
 
     return "\n".join([
-        f"=== CACHED MATCH DATA: {home} vs {away} (Kickoff: {kickoff}) ===",
+        f"=== CACHED MATCH DATA: {home} vs {away} (Kickoff: {kickoff}, AllSports match_id: {match_id}) ===",
         f"Pre-fetched at 7am UTC — Last updated: {fetched_at}",
         "",
         f"[CACHED — WEATHER] (Source: {weather.get('source', 'wttr.in')}, Last updated: {fetched_at})",
@@ -631,7 +842,6 @@ def format_cache_context(data: dict) -> str:
         "=== END CACHED DATA — supplement with live search if needed ===",
     ])
 
-
 # ─── Typing indicator ─────────────────────────────────────────────────────────
 
 async def keep_typing(chat_id: int, bot) -> None:
@@ -643,6 +853,7 @@ async def keep_typing(chat_id: int, bot) -> None:
     except asyncio.CancelledError:
         pass
 
+# ─── Message handlers ─────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -661,7 +872,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         conversation_history[user_id].append({"role": "user", "content": user_text})
 
-    # Start typing immediately so the user sees activity even while waiting in queue.
     typing_task = asyncio.create_task(
         keep_typing(update.effective_chat.id, context.bot)
     )
@@ -669,11 +879,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         async with _queue_lock:
             assistant_text = await run_agent_loop(user_id, update, context)
-
-            # Replace enriched entry with the original user text to keep history clean
             conversation_history[user_id][-1] = {"role": "user", "content": user_text}
             conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
-
             if len(conversation_history[user_id]) > 40:
                 conversation_history[user_id] = conversation_history[user_id][-40:]
 
@@ -733,21 +940,16 @@ async def run_agent_loop(
 
         if response.stop_reason == "tool_use":
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-
             for block in tool_use_blocks:
                 logger.info("Web search query: %s", block.input.get("query", ""))
-
             loop_messages.append({
                 "role": "assistant",
                 "content": [b.model_dump() for b in response.content],
             })
-            tool_results = [
+            loop_messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": b.id, "content": ""}
                 for b in tool_use_blocks
-            ]
-            loop_messages.append({"role": "user", "content": tool_results})
-            first_call = False
-
+            ]})
         else:
             text_blocks = [b.text for b in response.content if b.type == "text"]
             return "\n".join(text_blocks).strip() or "I couldn't find any information on that."
@@ -781,25 +983,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         "data": photo_b64,
                     },
                 },
-                {
-                    "type": "text",
-                    "text": caption,
-                },
+                {"type": "text", "text": caption},
             ],
         }
         conversation_history[user_id].append(image_message)
 
         async with _queue_lock:
             assistant_text = await run_agent_loop(user_id, update, context)
-
-            # Replace the image entry with a lightweight text placeholder so future
-            # conversation turns don't re-send the raw image bytes.
             conversation_history[user_id][-1] = {
                 "role": "user",
                 "content": f"[Image sent] {caption}",
             }
             conversation_history[user_id].append({"role": "assistant", "content": assistant_text})
-
             if len(conversation_history[user_id]) > 40:
                 conversation_history[user_id] = conversation_history[user_id][-40:]
 
@@ -834,6 +1029,7 @@ async def send_reply(update: Update, text: str) -> None:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Update %s caused error: %s", update, context.error)
 
+# ─── Health server ────────────────────────────────────────────────────────────
 
 HEALTH_PORT = 8765
 
@@ -860,7 +1056,12 @@ async def post_init(application: Application) -> None:
     global _queue_lock
     _queue_lock = asyncio.Lock()
     asyncio.create_task(health_server())
+    if ALLSPORTS_API_KEY:
+        logger.info("AllSports API key present — structured data source active")
+    else:
+        logger.warning("ALLSPORTS_API_KEY not set — falling back to web search for all data")
 
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
@@ -884,7 +1085,8 @@ def main() -> None:
         time=dt_time(hour=7, minute=0, tzinfo=timezone.utc),
     )
 
-    logger.info("Bot is starting with web search and league subscriptions enabled...")
+    logger.info("Bot starting — AllSports API %s",
+                "ACTIVE" if ALLSPORTS_API_KEY else "NOT CONFIGURED (web search fallback only)")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
