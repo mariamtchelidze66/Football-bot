@@ -257,7 +257,8 @@ async def fetch_league_scores(league_key: str, league_name: str) -> str | None:
     loop_messages = list(messages)
 
     while True:
-        response = client.messages.create(
+        response = await asyncio.to_thread(
+            client.messages.create,
             model="claude-sonnet-4-6",
             max_tokens=1024,
             system=SCORES_PROMPT,
@@ -373,7 +374,8 @@ async def claude_fetch_json(prompt: str) -> dict | list:
     """Run Claude + web search agentic loop expecting a JSON response."""
     loop_msgs = [{"role": "user", "content": prompt}]
     while True:
-        response = client.messages.create(
+        response = await asyncio.to_thread(
+            client.messages.create,
             model="claude-sonnet-4-6",
             max_tokens=2048,
             system=FETCH_SYSTEM,
@@ -627,7 +629,8 @@ async def run_agent_loop(
     loop_messages = list(conversation_history[user_id])
 
     while True:
-        response = client.messages.create(
+        response = await asyncio.to_thread(
+            client.messages.create,
             model="claude-sonnet-4-6",
             max_tokens=8192,
             system=SYSTEM_PROMPT,
