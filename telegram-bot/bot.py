@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import logging
 from datetime import datetime, timezone
@@ -283,6 +284,16 @@ async def score_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error("Error fetching scores for %s: %s", league_key, e)
 
 
+async def keep_typing(chat_id: int, bot) -> None:
+    """Send a typing action every 4 seconds until cancelled."""
+    try:
+        while True:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_text = update.message.text
@@ -292,7 +303,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     conversation_history[user_id].append({"role": "user", "content": user_text})
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    typing_task = asyncio.create_task(
+        keep_typing(update.effective_chat.id, context.bot)
+    )
 
     try:
         assistant_text = await run_agent_loop(user_id, update, context)
@@ -312,6 +325,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error("Unexpected error: %s", e)
         await update.message.reply_text("An unexpected error occurred. Please try again.")
+    finally:
+        typing_task.cancel()
 
 
 async def run_agent_loop(
@@ -320,7 +335,6 @@ async def run_agent_loop(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> str:
     loop_messages = list(conversation_history[user_id])
-    search_performed = False
 
     while True:
         response = client.messages.create(
@@ -336,12 +350,6 @@ async def run_agent_loop(
 
         if response.stop_reason == "tool_use":
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-
-            if not search_performed:
-                await context.bot.send_chat_action(
-                    chat_id=update.effective_chat.id, action="typing"
-                )
-                search_performed = True
 
             for block in tool_use_blocks:
                 logger.info("Web search query: %s", block.input.get("query", ""))
@@ -365,7 +373,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     caption = update.message.caption or "Analyse this image and provide detailed betting insights."
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    typing_task = asyncio.create_task(
+        keep_typing(update.effective_chat.id, context.bot)
+    )
 
     try:
         photo = update.message.photo[-1]
@@ -418,6 +428,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.error("Unexpected error processing photo: %s", e)
         await update.message.reply_text("Sorry, I couldn't process that image. Please try again.")
+    finally:
+        typing_task.cancel()
 
 
 async def send_reply(update: Update, text: str) -> None:
