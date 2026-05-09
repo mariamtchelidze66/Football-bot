@@ -3,8 +3,8 @@ import json
 import asyncio
 import base64
 import logging
-import urllib.request
 import urllib.parse
+import requests as _requests
 from datetime import datetime, time as dt_time, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -115,11 +115,15 @@ SYSTEM_PROMPT = (
     "6. The referee's penalty decisions record this season (penalties awarded per game or total).\n\n"
     "WEATHER FORECAST:\n"
     "7. Real-time weather for the match city on match day. "
-    "You MUST fetch this by searching for the exact URL: https://wttr.in/{CITY}?format=j1 "
-    "where {CITY} is replaced with the match city name (e.g. https://wttr.in/Liverpool?format=j1). "
-    "Parse the JSON response and report: temperature (°C from 'temp_C'), "
-    "wind speed (km/h from 'windspeedKmph'), and rain probability (% from 'chanceofrain'). "
-    "NEVER estimate or guess weather from general knowledge — always fetch the live wttr.in URL.\n\n"
+    "Fetch in this order — try source 1 first, fall back to source 2 if it fails:\n"
+    "  Source 1 (primary): https://wttr.in/{CITY}?format=j1 "
+    "— parse temp_C, windspeedKmph, chanceofrain from the JSON. "
+    "  Source 2 (fallback): Open-Meteo — first geocode the city at "
+    "https://geocoding-api.open-meteo.com/v1/search?name={CITY}&count=1 to get lat/lon, "
+    "then fetch https://api.open-meteo.com/v1/forecast?latitude=LAT&longitude=LON&current_weather=true"
+    "&hourly=precipitation_probability and read temperature, windspeed, precipitation_probability.\n"
+    "Always state which source the weather data came from, e.g. '(Source: wttr.in)' or '(Source: Open-Meteo)'.\n"
+    "NEVER estimate or guess weather — always fetch live data from one of these two URLs.\n\n"
     "Present each section clearly with a heading. "
     "If any data point is unavailable after fetching, state that explicitly rather than omitting the section.\n\n"
     "CACHE RULE: When a user's message begins with a block marked '=== CACHED MATCH DATA: ...' "
@@ -369,11 +373,11 @@ def is_cache_fresh(fetched_at_iso: str) -> bool:
 
 
 def _wttr_blocking(city: str) -> dict:
-    """Blocking wttr.in fetch — called via asyncio.to_thread."""
+    """Primary weather fetch from wttr.in — blocking, run via asyncio.to_thread."""
     url = f"https://wttr.in/{urllib.parse.quote(city)}?format=j1"
-    req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read())
+    resp = _requests.get(url, headers={"User-Agent": "curl/7.0"}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
     cond = data["current_condition"][0]
     today_weather = data.get("weather", [{}])[0]
     hourly = today_weather.get("hourly", [{}])
@@ -388,14 +392,48 @@ def _wttr_blocking(city: str) -> dict:
     }
 
 
+def _openmeteo_blocking(city: str) -> dict:
+    """Fallback weather fetch from Open-Meteo — blocking, run via asyncio.to_thread."""
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(city)}&count=1"
+    geo = _requests.get(geo_url, timeout=10).json()
+    results = geo.get("results")
+    if not results:
+        raise ValueError(f"Open-Meteo geocoding found no results for '{city}'")
+    lat, lon = results[0]["latitude"], results[0]["longitude"]
+
+    wx_url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}&current_weather=true"
+        f"&hourly=precipitation_probability&timezone=auto&forecast_days=1"
+    )
+    wx = _requests.get(wx_url, timeout=10).json()
+    cw = wx["current_weather"]
+    rain_chance = wx.get("hourly", {}).get("precipitation_probability", [None])[0]
+    return {
+        "temperature_c": str(cw["temperature"]),
+        "wind_kmph": str(round(cw["windspeed"])),
+        "rain_chance_pct": str(rain_chance) if rain_chance is not None else "N/A",
+        "description": f"WMO code {cw['weathercode']}",
+        "source": "Open-Meteo",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def fetch_weather(city: str) -> dict:
+    """Try wttr.in first; fall back to Open-Meteo if it fails."""
     try:
         return await asyncio.to_thread(_wttr_blocking, city)
     except Exception as e:
-        logger.warning("wttr.in fetch failed for %s: %s", city, e)
+        logger.warning("wttr.in failed for '%s' (%s) — trying Open-Meteo", city, e)
+    try:
+        result = await asyncio.to_thread(_openmeteo_blocking, city)
+        logger.info("Open-Meteo weather OK for '%s'", city)
+        return result
+    except Exception as e2:
+        logger.error("Both weather sources failed for '%s': %s", city, e2)
         return {
-            "error": str(e),
-            "source": "wttr.in",
+            "error": "Both wttr.in and Open-Meteo failed",
+            "source": "none",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -577,7 +615,7 @@ def format_cache_context(data: dict) -> str:
         f"=== CACHED MATCH DATA: {home} vs {away} (Kickoff: {kickoff}) ===",
         f"Pre-fetched at 7am UTC — Last updated: {fetched_at}",
         "",
-        f"[CACHED — WEATHER] (Source: wttr.in, Last updated: {fetched_at})",
+        f"[CACHED — WEATHER] (Source: {weather.get('source', 'wttr.in')}, Last updated: {fetched_at})",
         weather_line,
         "",
         fmt("LINEUPS", data.get("lineups", {})),
