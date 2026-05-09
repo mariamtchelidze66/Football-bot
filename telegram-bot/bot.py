@@ -629,6 +629,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await send_reply(update, assistant_text)
 
+    except anthropic.RateLimitError:
+        logger.error("Rate limit exhausted after all retries for user %d", user_id)
+        await update.message.reply_text(
+            "Sorry, Claude is overloaded right now and couldn't respond after several retries. Please try again in a few minutes."
+        )
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
         await update.message.reply_text(
@@ -649,14 +654,30 @@ async def run_agent_loop(
     loop_messages = list(conversation_history[user_id])
 
     while True:
-        response = await asyncio.to_thread(
-            client.messages.create,
-            model="claude-sonnet-4-6",
-            max_tokens=8192,
-            system=SYSTEM_PROMPT,
-            tools=[WEB_SEARCH_TOOL],
-            messages=loop_messages,
-        )
+        for attempt in range(4):
+            try:
+                response = await asyncio.to_thread(
+                    client.messages.create,
+                    model="claude-sonnet-4-6",
+                    max_tokens=8192,
+                    system=SYSTEM_PROMPT,
+                    tools=[WEB_SEARCH_TOOL],
+                    messages=loop_messages,
+                )
+                break
+            except anthropic.RateLimitError:
+                wait = 60 * (attempt + 1)
+                logger.warning("Rate limited, waiting %ds (attempt %d/4)", wait, attempt + 1)
+                if attempt == 0:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="⏳ Claude is busy right now — retrying in about a minute, please hang on…"
+                    )
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(wait)
+        else:
+            raise RuntimeError("Exhausted retries")
 
         logger.info("stop_reason=%s content_types=%s", response.stop_reason,
                     [b.type for b in response.content])
@@ -733,6 +754,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await send_reply(update, assistant_text)
 
+    except anthropic.RateLimitError:
+        logger.error("Rate limit exhausted after all retries for photo from user %d", user_id)
+        await update.message.reply_text(
+            "Sorry, Claude is overloaded right now and couldn't analyse the image after several retries. Please try again in a few minutes."
+        )
     except anthropic.APIError as e:
         logger.error("Anthropic API error processing photo: %s", e)
         await update.message.reply_text(
