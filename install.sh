@@ -199,36 +199,87 @@ else
 fi
 
 # ---------- 5) config / secrets ----------
-step "5) Configuration (secrets)"
+step "5) Configuration & connection test"
 # The bot reads these from the environment (see telegram-bot/bot.py):
 #   TELEGRAM_BOT_TOKEN  (required)  — from @BotFather
 #   ANTHROPIC_API_KEY   (required)  — from console.anthropic.com
 #   APISPORTS_KEY       (optional)  — football data from api-sports.io
-# We write a BLANK template only; you fill in your own values. Never commit it.
+# This step ASKS for each secret and TESTS the connection before saving.
 ENV_FILE="$DEST/.env"
-if [[ -f "$ENV_FILE" ]]; then
-  info ".env already exists at $ENV_FILE — leaving it untouched."
-elif ask "Create a blank .env template at $ENV_FILE?" y; then
-  cat > "$ENV_FILE" <<'EOF'
-# Football-bot secrets — FILL THESE IN. Do NOT commit this file.
-#
-# Required: Telegram bot token from @BotFather
-TELEGRAM_BOT_TOKEN=
-#
-# Required: Anthropic API key from https://console.anthropic.com/
-ANTHROPIC_API_KEY=
-#
-# Optional: API-Sports football data key from https://www.api-sports.io/
-# (leave blank to run without live fixtures/standings; the operator may also
-#  use football-data.org — add that key here too if the code is wired for it)
-APISPORTS_KEY=
+
+# read a secret from the real terminal (hidden input, via fd 3)
+ask_secret(){  # ask_secret "prompt" -> echoes typed value
+  local q="$1" ans=""
+  if [[ "$ASSUME_YES" == "1" ]]; then echo ""; return; fi
+  read -rsp "$(echo -e "${Y}[?]${N} $q ")" -u 3 ans || ans=""
+  echo >&2   # newline after the hidden input
+  echo "$ans"
+}
+test_telegram(){  # $1=token -> 0 if Telegram accepts it
+  local out
+  out=$(curl -fsS --max-time 15 "https://api.telegram.org/bot$1/getMe" 2>/dev/null) || return 1
+  echo "$out" | grep -q '"ok":true'
+}
+test_anthropic(){  # $1=key -> 0 if the key authenticates
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
+    https://api.anthropic.com/v1/models \
+    -H "x-api-key: $1" -H "anthropic-version: 2023-06-01" 2>/dev/null)
+  [[ "$code" == "200" ]]
+}
+
+TELEGRAM_BOT_TOKEN=""; ANTHROPIC_API_KEY=""; APISPORTS_KEY=""
+
+if [[ -f "$ENV_FILE" ]] && ! ask ".env already exists at $ENV_FILE — overwrite it?" n; then
+  info "Keeping existing .env; loading it to re-test the connections."
+  set -a; . "$ENV_FILE"; set +a
+else
+  # --- Telegram bot token (required) ---
+  while :; do
+    TELEGRAM_BOT_TOKEN="$(ask_secret 'Telegram bot token (from @BotFather):')"
+    if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+      warn "Empty token — the bot cannot run without it."
+      ask "Skip for now and fill .env manually?" n && break || continue
+    fi
+    info "Testing the Telegram token…"
+    if test_telegram "$TELEGRAM_BOT_TOKEN"; then ok "Telegram token works — connected ✅"; break
+    else err "Telegram rejected that token."; ask "Try a different token?" y || break; fi
+  done
+  # --- Anthropic API key (required) ---
+  while :; do
+    ANTHROPIC_API_KEY="$(ask_secret 'Anthropic API key (from console.anthropic.com):')"
+    if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+      warn "Empty key — the bot cannot run without it."
+      ask "Skip for now and fill .env manually?" n && break || continue
+    fi
+    info "Testing the Anthropic key…"
+    if test_anthropic "$ANTHROPIC_API_KEY"; then ok "Anthropic key works — connected ✅"; break
+    else err "Anthropic rejected that key (or no network)."; ask "Try a different key?" y || break; fi
+  done
+  # --- optional football data key ---
+  if ask "Add an optional API-Sports football key now?" n; then
+    APISPORTS_KEY="$(ask_secret 'API-Sports key (leave blank to skip):')"
+  fi
+  # write .env with the values
+  umask 077
+  cat > "$ENV_FILE" <<EOF
+# Football-bot secrets — do NOT commit this file.
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+APISPORTS_KEY=${APISPORTS_KEY}
 EOF
   chmod 600 "$ENV_FILE" 2>/dev/null || true
-  ok "Wrote blank template: $ENV_FILE  (edit it and add your secrets)"
-  warn "Load it before running, e.g.:  set -a; . $ENV_FILE; set +a"
-else
-  warn "Skipped .env — you must export TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY yourself."
+  ok "Saved $ENV_FILE (chmod 600)."
 fi
+
+# --- final connectivity summary ---
+step "5b) Connection summary"
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && test_telegram "$TELEGRAM_BOT_TOKEN"; then
+  ok "Telegram: connected ✅"
+else warn "Telegram: NOT verified — check TELEGRAM_BOT_TOKEN in $ENV_FILE"; fi
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]] && test_anthropic "$ANTHROPIC_API_KEY"; then
+  ok "Anthropic: connected ✅"
+else warn "Anthropic: NOT verified — check ANTHROPIC_API_KEY in $ENV_FILE"; fi
 
 # ---------- 6) run / test ----------
 step "6) Run the bot"
